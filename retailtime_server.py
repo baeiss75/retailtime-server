@@ -321,18 +321,43 @@ def license_list():
 # publishing a new notice requires the HQ key.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Version manifest — lets HQ publish "here's the version everyone should
+# be on, get it here" without emailing exe files around. Version info
+# isn't sensitive, so GET needs no auth; only publishing needs the HQ
+# key. Every publish is kept in history (never overwritten), so an older
+# version's download link stays findable — including for a ROLLBACK:
+# re-publishing an OLDER version as "current" is exactly how you tell
+# every branch "go back to this one, the newer build had a problem."
+# ---------------------------------------------------------------------------
+
 VERSION_PATH = os.path.join(DATA_DIR, "version.json")
+
+
+def _load_version_data():
+    if not os.path.exists(VERSION_PATH):
+        return {"current": None, "history": []}
+    try:
+        with open(VERSION_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        data.setdefault("current", None)
+        data.setdefault("history", [])
+        return data
+    except Exception:
+        return {"current": None, "history": []}
 
 
 @app.get("/version")
 def version_get():
-    if not os.path.exists(VERSION_PATH):
+    cur = _load_version_data()["current"]
+    if not cur:
         return jsonify(version="", url="", notes="")
-    try:
-        with open(VERSION_PATH, "r", encoding="utf-8") as fh:
-            return jsonify(**json.load(fh))
-    except Exception:
-        return jsonify(version="", url="", notes="")
+    return jsonify(**cur)
+
+
+@app.get("/versions")
+def versions_list():
+    return jsonify(history=_load_version_data()["history"])
 
 
 @app.post("/version")
@@ -344,11 +369,14 @@ def version_set():
     notes = str(body.get("notes", "")).strip()
     if not version or not url:
         abort(400, "version and url are required")
+    entry = {"version": version, "url": url, "notes": notes,
+             "published": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    data = _load_version_data()
+    data["current"] = entry
+    data["history"].append(entry)  # newest last; never removed/overwritten
     fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"version": version, "url": url, "notes": notes,
-                   "published": datetime.now().strftime(
-                       "%Y-%m-%d %H:%M:%S")}, fh)
+        json.dump(data, fh)
     os.replace(tmp, VERSION_PATH)
     return jsonify(ok=True, version=version)
 
