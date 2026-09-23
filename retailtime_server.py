@@ -243,5 +243,172 @@ def branch_key(branch):
     return jsonify(branch=branch, key=derive_branch_key(branch))
 
 
+# ---------------------------------------------------------------------------
+# License revocation. license_id is an opaque, non-sensitive identifier
+# (not a secret) — the license key's real protection is its signature,
+# verified locally by the app using LICENSE_SECRET (a separate value not
+# stored here). This endpoint only answers "has this id been killed?" so
+# the status check itself needs no auth; only revoking/unrevoking does.
+# ---------------------------------------------------------------------------
+
+REVOKED_PATH = os.path.join(DATA_DIR, "revoked_licenses.json")
+LICENSE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _load_revoked():
+    if not os.path.exists(REVOKED_PATH):
+        return {}
+    try:
+        with open(REVOKED_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_revoked(data):
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, REVOKED_PATH)
+
+
+@app.get("/license/<license_id>")
+def license_status(license_id):
+    if not LICENSE_RE.match(license_id):
+        abort(400, "invalid license id")
+    revoked = _load_revoked()
+    entry = revoked.get(license_id)
+    return jsonify(license_id=license_id, revoked=bool(entry),
+                  reason=(entry or {}).get("reason", "") if entry else "")
+
+
+@app.post("/admin/license/revoke/<license_id>")
+def license_revoke(license_id):
+    check_hq_auth()
+    if not LICENSE_RE.match(license_id):
+        abort(400, "invalid license id")
+    body = request.get_json(silent=True) or {}
+    revoked = _load_revoked()
+    revoked[license_id] = {
+        "reason": body.get("reason", ""),
+        "revoked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    _save_revoked(revoked)
+    return jsonify(ok=True, license_id=license_id, revoked=True)
+
+
+@app.post("/admin/license/unrevoke/<license_id>")
+def license_unrevoke(license_id):
+    check_hq_auth()
+    if not LICENSE_RE.match(license_id):
+        abort(400, "invalid license id")
+    revoked = _load_revoked()
+    revoked.pop(license_id, None)
+    _save_revoked(revoked)
+    return jsonify(ok=True, license_id=license_id, revoked=False)
+
+
+@app.get("/admin/license/list")
+def license_list():
+    check_hq_auth()
+    return jsonify(revoked=_load_revoked())
+
+
+# ---------------------------------------------------------------------------
+# Version manifest — lets HQ publish "a new RetailTime build is available,
+# get it here" without emailing exe files around. Version info itself
+# isn't sensitive, so GET needs no auth (even a freshly-installed branch
+# machine with no key configured yet could, in principle, check); only
+# publishing a new notice requires the HQ key.
+# ---------------------------------------------------------------------------
+
+VERSION_PATH = os.path.join(DATA_DIR, "version.json")
+
+
+@app.get("/version")
+def version_get():
+    if not os.path.exists(VERSION_PATH):
+        return jsonify(version="", url="", notes="")
+    try:
+        with open(VERSION_PATH, "r", encoding="utf-8") as fh:
+            return jsonify(**json.load(fh))
+    except Exception:
+        return jsonify(version="", url="", notes="")
+
+
+@app.post("/version")
+def version_set():
+    check_hq_auth()
+    body = request.get_json(silent=True) or {}
+    version = str(body.get("version", "")).strip()
+    url = str(body.get("url", "")).strip()
+    notes = str(body.get("notes", "")).strip()
+    if not version or not url:
+        abort(400, "version and url are required")
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"version": version, "url": url, "notes": notes,
+                   "published": datetime.now().strftime(
+                       "%Y-%m-%d %H:%M:%S")}, fh)
+    os.replace(tmp, VERSION_PATH)
+    return jsonify(ok=True, version=version)
+
+
+# ---------------------------------------------------------------------------
+# Daily report cloud backup — each branch's Store Close report gets
+# uploaded here too, so it's retrievable even if that branch's computer
+# is dead/unreachable. Same branch-key scoping as /upload — a branch can
+# only push/read its OWN reports; the HQ key can read any branch's.
+# ---------------------------------------------------------------------------
+
+REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _report_path(branch, day):
+    if not BRANCH_RE.match(branch):
+        abort(400, "invalid branch name")
+    if not REPORT_DATE_RE.match(day):
+        abort(400, "invalid date (expected YYYY-MM-DD)")
+    d = os.path.join(DATA_DIR, "reports", branch)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{day}.html")
+
+
+@app.post("/report/<branch>/<day>")
+def report_upload(branch, day):
+    check_branch_auth(branch)
+    body = request.get_data(cache=False)
+    if not body:
+        abort(400, "empty report")
+    if len(body) > 5 * 1024 * 1024:
+        abort(413, "report too large")
+    path = _report_path(branch, day)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+    return jsonify(ok=True, branch=branch, date=day, bytes=len(body))
+
+
+@app.get("/report/<branch>/<day>")
+def report_download(branch, day):
+    check_branch_auth(branch)
+    path = _report_path(branch, day)
+    if not os.path.exists(path):
+        abort(404, "no report on file for that branch/date")
+    return send_file(path, mimetype="text/html")
+
+
+@app.get("/reports/<branch>")
+def report_list(branch):
+    check_branch_auth(branch)
+    if not BRANCH_RE.match(branch):
+        abort(400, "invalid branch name")
+    d = os.path.join(DATA_DIR, "reports", branch)
+    if not os.path.isdir(d):
+        return jsonify(branch=branch, dates=[])
+    dates = sorted(fn[:-5] for fn in os.listdir(d) if fn.endswith(".html"))
+    return jsonify(branch=branch, dates=dates)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
